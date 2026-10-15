@@ -1,18 +1,23 @@
 import streamlit as st
 import pandas as pd
 import requests
-import time
 
-st.set_page_config(page_title="Multi-Strategy Crypto Bot", layout="wide", page_icon="📈")
+st.set_page_config(page_title="Pro Multi-Market Crypto Bot", layout="wide", page_icon="🚀")
 
 # ---------------------------------------------------------
-# 1. جلب البيانات من Binance
+# 1. جلب قائمة العملات (أشهر عملات السوق لتجنب أي تعليق)
 # ---------------------------------------------------------
-@st.cache_data(ttl=10)
-def get_klines(symbol="BTCUSDT", interval="1m", limit=300):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+@st.cache_data(ttl=300)
+def get_top_symbols():
+    return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "AVAXUSDT", "ADAUSDT", "DOGEUSDT"]
+
+# ---------------------------------------------------------
+# 2. جلب الشمعات وحساب المؤشرات لعملة محددة
+# ---------------------------------------------------------
+def analyze_symbol(symbol):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=15m&limit=100"
     try:
-        res = requests.get(url, timeout=10)
+        res = requests.get(url, timeout=5)
         data = res.json()
         df = pd.DataFrame(data, columns=[
             'open_time', 'open', 'high', 'low', 'close', 'volume',
@@ -21,198 +26,144 @@ def get_klines(symbol="BTCUSDT", interval="1m", limit=300):
         df['close'] = df['close'].astype(float)
         df['high'] = df['high'].astype(float)
         df['low'] = df['low'].astype(float)
-        df['open'] = df['open'].astype(float)
-        return df
-    except Exception as e:
-        st.error(f"خطأ في سحب البيانات: {e}")
-        return pd.DataFrame()
+        
+        # مؤشرات سريعة
+        df['EMA_20'] = df['close'].ewm(span=20, adjust=False).mean()
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+        
+        # ATR
+        high_low = df['high'] - df['low']
+        high_close = (df['high'] - df['close'].shift()).abs()
+        low_close = (df['low'] - df['close'].shift()).abs()
+        df['ATR'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(14).mean()
+        
+        return df.iloc[-1], df.iloc[-2]
+    except:
+        return None, None
 
 # ---------------------------------------------------------
-# 2. حساب المؤشرات الفنية لكافة الاستراتيجيات
-# ---------------------------------------------------------
-def calculate_indicators(df):
-    if df.empty:
-        return df
-    
-    # متوسطات متحركة لتقاطع المتوسطات
-    df['EMA_9'] = df['close'].ewm(span=9, adjust=False).mean()
-    df['EMA_21'] = df['close'].ewm(span=21, adjust=False).mean()
-    
-    # RSI (14)
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-    
-    # Bollinger Bands (20, 2)
-    df['BB_Mid'] = df['close'].rolling(window=20).mean()
-    bb_std = df['close'].rolling(window=20).std()
-    df['BB_Upper'] = df['BB_Mid'] + (bb_std * 2)
-    df['BB_Lower'] = df['BB_Mid'] - (bb_std * 2)
-    
-    # ATR (14) لإدارة المخاطر
-    high_low = df['high'] - df['low']
-    high_close = (df['high'] - df['close'].shift()).abs()
-    low_close = (df['low'] - df['close'].shift()).abs()
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    df['ATR'] = ranges.max(axis=1).rolling(14).mean()
-    
-    return df
-
-# ---------------------------------------------------------
-# 3. إدارة جلسة المحاكاة
+# 3. إدارة جلسة المحاكاة والربح التراكمي
 # ---------------------------------------------------------
 if 'cash' not in st.session_state:
     st.session_state.cash = 1000.0
-if 'position' not in st.session_state:
-    st.session_state.position = None
+if 'open_positions' not in st.session_state:
+    st.session_state.open_positions = {}
 if 'trade_history' not in st.session_state:
     st.session_state.trade_history = []
 
 # ---------------------------------------------------------
-# 4. الشريط الجانبي (الإعدادات واختيار الاستراتيجية)
+# 4. لوحة التحكم الجانبية
 # ---------------------------------------------------------
-st.sidebar.title("⚙️ لوحة تحكم الاستراتيجيات")
-symbol = st.sidebar.selectbox("الزوج", ["BTCUSDT", "ETHUSDT", "SOLUSDT"], index=0)
-timeframe = st.sidebar.selectbox("الإطار الزمني", ["1m", "3m", "5m", "15m"], index=0)
+st.sidebar.title("⚡ إعدادات الماسح الشامل")
+max_pos = st.sidebar.slider("أقصى عدد صفقات مفتوحة", 1, 4, 2)
 
-# اختيار الاستراتيجية من القائمة
-strategy_choice = st.sidebar.selectbox(
-    "اختر استراتيجية التداول",
-    [
-        "1. تقاطع المتوسطات السريعة (EMA 9/21)",
-        "2. التشبع البيعي لـ RSI (< 30)",
-        "3. ارتداد البولنجر باند السفلي"
-    ]
-)
-
-auto_refresh = st.sidebar.checkbox("تحديث تلقائي كل 10 ثوانٍ", value=True)
-
-if st.sidebar.button("إعادة ضبط حساب المحاكاة"):
+if st.sidebar.button("🔄 إعادة ضبط المحفظة"):
     st.session_state.cash = 1000.0
-    st.session_state.position = None
+    st.session_state.open_positions = {}
     st.session_state.trade_history = []
     st.rerun()
 
+st.title("🚀 Pro Crypto Multi-Market Bot")
+st.markdown("لوحة تحكم ذكية تمسح أهم أسواق العملات الرقمية وتنفذ صفقات بربح تراكمي.")
+
+symbols = get_top_symbols()
+
+# حساب إجمالي قيمة المحفظة (الرصيد النقدي + الصفقات المفتوحة)
+total_equity = st.session_state.cash
+for sym, pos in list(st.session_state.open_positions.items()):
+    latest, _ = analyze_symbol(sym)
+    if latest is not None:
+        total_equity += pos['qty'] * latest['close']
+
+# عرض المؤشرات العليا الرئيسية
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("إجمالي المحفظة (Equity)", f"${total_equity:,.2f}")
+col2.metric("الكاش المتاح", f"${st.session_state.cash:,.2f}")
+col3.metric("الصفقات النشطة", len(st.session_state.open_positions))
+col4.metric("الصفقات المكتملة", len(st.session_state.trade_history))
+
+st.markdown("---")
+
 # ---------------------------------------------------------
-# 5. تنفيذ منطق التداول حسب الاستراتيجية المختارة
+# 5. فحص السوق وإدارة الصفقات
 # ---------------------------------------------------------
-df = get_klines(symbol=symbol, interval=timeframe, limit=300)
-df = calculate_indicators(df)
+signals = []
+for sym in symbols:
+    latest, prev = analyze_symbol(sym)
+    if latest is not None and prev is not None:
+        price = latest['close']
+        ema = latest['EMA_20']
+        rsi = latest['RSI']
+        atr = latest['ATR']
+        
+        # إشارة شراء ذكية وسريعة
+        if (price > ema) and (prev['RSI'] <= 45 and rsi > 45):
+            signals.append({'symbol': sym, 'price': price, 'atr': atr})
 
-if not df.empty:
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
-    
-    current_price = latest['close']
-    atr = latest['ATR']
-    rsi = latest['RSI']
-    
-    equity = st.session_state.cash
-    if st.session_state.position:
-        equity = st.session_state.position['qty'] * current_price
+# تحديث وإغلاق الصفقات المفتوحة عند تحقيق الأهداف
+for sym, pos in list(st.session_state.open_positions.items()):
+    latest, _ = analyze_symbol(sym)
+    if latest is not None:
+        curr_price = latest['close']
+        if curr_price <= pos['sl'] or curr_price >= pos['tp'] or latest['RSI'] >= 75:
+            exit_cash = pos['qty'] * curr_price
+            pnl = exit_cash - (pos['qty'] * pos['entry'])
+            st.session_state.cash += exit_cash
+            st.session_state.trade_history.append({
+                'العملة': sym,
+                'الدخول': f"${pos['entry']:,.2f}",
+                'الخروج': f"${curr_price:,.2f}",
+                'الربح/الخسارة': f"${pnl:,.2f}",
+                'الوقت': pd.Timestamp.now().strftime('%H:%M:%S')
+            })
+            del st.session_state.open_positions[sym]
 
-    st.title(f"🚀 Multi-Strategy Bot [{timeframe}] - {symbol}")
-    st.markdown(f"**الاستراتيجية النشطة حالياً:** `{strategy_choice}`")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("الرصيد النقدي", f"${st.session_state.cash:,.2f}")
-    col2.metric("السعر الحالي", f"${current_price:,.2f}")
-    col3.metric("مؤشر RSI", f"{rsi:.1f}")
-    col4.metric("إجمالي المحفظة", f"${equity:,.2f}")
-
-    st.markdown("---")
-
-    # تحديد إشارة الشراء بناءً على الاستراتيجية المختارة
-    buy_signal = False
-    exit_signal = False
-    exit_reason_custom = ""
-
-    if "1." in strategy_choice:
-        # تقاطع المتوسطات: EMA 9 يتقاطع صعوداً فوق EMA 21
-        buy_signal = (prev['EMA_9'] <= prev['EMA_21']) and (latest['EMA_9'] > latest['EMA_21'])
-        exit_signal = (prev['EMA_9'] >= prev['EMA_21']) and (latest['EMA_9'] < latest['EMA_21'])
-        exit_reason_custom = "EMA Cross Down 📉"
-
-    elif "2." in strategy_choice:
-        # RSI Oversold: خروج من منطقة تحت 30 للصعود فوقها
-        buy_signal = (prev['RSI'] <= 30) and (latest['RSI'] > 30)
-        exit_signal = latest['RSI'] >= 70
-        exit_reason_custom = "RSI Overbought 📈"
-
-    elif "3." in strategy_choice:
-        # Bollinger Bands Bounce: ملامسة السعر للخط السفلي والارتداد للداخل
-        buy_signal = (prev['close'] <= prev['BB_Lower']) and (latest['close'] > latest['BB_Lower'])
-        exit_signal = latest['close'] >= latest['BB_Mid']
-        exit_reason_custom = "BB Midline Target 🎯"
-
-    # فتح الصفقة إذا لم تكن موجودة وجاءت إشارة الشراء
-    if st.session_state.position is None:
-        if buy_signal:
-            entry_price = current_price
-            sl = entry_price - (1.5 * atr)
-            tp = entry_price + (2.5 * atr)
-            qty = (st.session_state.cash * 0.99) / entry_price
+# فتح صفقات جديدة إذا توفر كاش
+for sig in signals:
+    sym = sig['symbol']
+    if sym not in st.session_state.open_positions and len(st.session_state.open_positions) < max_pos:
+        if st.session_state.cash > 50:
+            allocation = st.session_state.cash * 0.4  # استثمار 40% من الكاش المتاح بكل صفقة
+            st.session_state.cash -= allocation
+            qty = allocation / sig['price']
+            sl = sig['price'] - (1.5 * sig['atr'])
+            tp = sig['price'] + (2.5 * sig['atr'])
             
-            st.session_state.position = {
-                'entry_price': entry_price,
+            st.session_state.open_positions[sym] = {
+                'entry': sig['price'],
                 'qty': qty,
                 'sl': sl,
-                'tp': tp,
-                'time': pd.Timestamp.now().strftime('%H:%M:%S')
+                'tp': tp
             }
-            st.session_state.cash -= (qty * entry_price)
-            st.success(f"🚀 تم فتح صفقة جديدة بناءً على الاستراتيجية بسعر: ${entry_price:,.2f}")
-            st.rerun()
 
-    # متابعة الصفقة المفتوحة
-    else:
-        pos = st.session_state.position
-        pnl = (current_price - pos['entry_price']) * pos['qty']
-        pnl_pct = ((current_price - pos['entry_price']) / pos['entry_price']) * 100
-        
-        st.subheader("📌 الصفقة المفتوحة حالياً")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.write(f"**سعر الدخول:** ${pos['entry_price']:,.2f}")
-        c2.write(f"**وقف الخسارة (SL):** ${pos['sl']:,.2f}")
-        c3.write(f"**أخذ الأرباح (TP):** ${pos['tp']:,.2f}")
-        c4.write(f"**الربح/الخسارة:** :{'green' if pnl>=0 else 'red'}[${pnl:,.2f} ({pnl_pct:.2f}%)]")
+# ---------------------------------------------------------
+# 6. عرض الجداول والبيانات بوضوح تام
+# ---------------------------------------------------------
+st.subheader("📌 الصفقات المفتوحة حالياً")
+if st.session_state.open_positions:
+    open_list = []
+    for sym, pos in st.session_state.open_positions.items():
+        latest, _ = analyze_symbol(sym)
+        curr_p = latest['close'] if latest is not None else pos['entry']
+        pnl_val = (curr_p - pos['entry']) * pos['qty']
+        open_list.append({
+            'العملة': sym,
+            'سعر الدخول': f"${pos['entry']:,.2f}",
+            'السعر الحالي': f"${curr_p:,.2f}",
+            'الربح الحالي': f"${pnl_val:,.2f}"
+        })
+    st.dataframe(pd.DataFrame(open_list), use_container_width=True)
+else:
+    st.info("🔍 البوت يبحث في الأسواق عن إشارات دخول مناسبة...")
 
-        hit_sl = current_price <= pos['sl']
-        hit_tp = current_price >= pos['tp']
-        
-        if hit_sl or hit_tp or exit_signal:
-            reason = "Stop Loss 🛑" if hit_sl else ("Take Profit 🎯" if hit_tp else exit_reason_custom)
-            exit_price = current_price
-            return_cash = pos['qty'] * exit_price
-            
-            st.session_state.cash += return_cash
-            st.session_state.trade_history.append({
-                'entry': pos['entry_price'],
-                'exit': exit_price,
-                'pnl': (exit_price - pos['entry_price']) * pos['qty'],
-                'reason': reason,
-                'time': pd.Timestamp.now().strftime('%H:%M:%S')
-            })
-            st.session_state.position = None
-            st.info(f"تم إغلاق الصفقة السبب: {reason} بسعر ${exit_price:,.2f}")
-            st.rerun()
+if st.session_state.trade_history:
+    st.subheader("📜 سجل الصفقات المغلقة (أرباح تراكمية)")
+    st.dataframe(pd.DataFrame(st.session_state.trade_history), use_container_width=True)
 
-    # عرض الرسم البياني المناسب حسب الاستراتيجية
-    st.subheader(f"📈 الرسوم البيانية والمؤشرات ({timeframe})")
-    if "1." in strategy_choice:
-        st.line_chart(df[['close', 'EMA_9', 'EMA_21']].tail(100))
-    elif "2." in strategy_choice:
-        st.line_chart(df[['close']].tail(100))
-        st.caption("مؤشر RSI الحالي: " + str(round(rsi, 2)))
-    else:
-        st.line_chart(df[['close', 'BB_Upper', 'BB_Mid', 'BB_Lower']].tail(100))
-
-    if st.session_state.trade_history:
-        st.subheader("📜 سجل الصفقات المكتملة")
-        st.dataframe(pd.DataFrame(st.session_state.trade_history))
-
-if auto_refresh:
-    time.sleep(10)
+# زر تحديث يدوي لتجنب تكرار الشاشة البيضاء وضمان ثبات الواجهة
+if st.button("🔄 تحديث السوق والصفقات الآن"):
     st.rerun()
