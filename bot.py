@@ -3,16 +3,6 @@ CryptoScan Paper Bot - single-file version (Streamlit + Binance public data).
 PAPER TRADING ONLY: no API keys, no real money.
 
 Run:  streamlit run bot.py
-
-
-Strategy (long-only, spot, no leverage):
-  * Trend filter : last closed candle is above its EMA (default 200)
-  * Entry        : RSI crosses UP through the entry level (rebound after weakness)
-  * Stop loss    : entry - ATR * multiplier
-  * Take profit  : entry + risk * reward ratio
-  * Extra exit   : RSI above the exit level
-  * Position size: fixed % of equity risked per trade, capped per coin, no leverage
-  * Fees         : 0.1% on every buy and every sell
 """
 import json
 import os
@@ -63,13 +53,12 @@ def fetch_one(symbol, interval, limit=500, ttl=15):
             with _LOCK:
                 _CACHE[key] = (now, df)
             return df.copy()
-        except Exception as e:  # try the next endpoint
+        except Exception as e:
             last_err = e
     raise RuntimeError(str(last_err))
 
 
 def fetch_all(symbols, interval, limit=500, ttl=15):
-    """Download all symbols at the same time. Returns (data, errors)."""
     data, errors = {}, {}
     if not symbols:
         return data, errors
@@ -122,7 +111,7 @@ def position_size(equity, cash, price, atr, p):
 
 
 # --------------------------------------------------------------------------
-# Paper portfolio (saved to paper_state.json so a browser refresh keeps it)
+# Paper portfolio (saved to paper_state.json)
 # --------------------------------------------------------------------------
 def default_state():
     return dict(cash=START_CASH, positions={}, last_candle={}, trades=[], equity_hist=[])
@@ -132,7 +121,18 @@ def load_state():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return {**default_state(), **json.load(f)}
+                saved = json.load(f)
+                state = {**default_state(), **saved}
+                # ضمان سلامة الأنواع وعدم وجود قيمة None تسبب أخطاء
+                if not isinstance(state.get("last_candle"), dict):
+                    state["last_candle"] = {}
+                if not isinstance(state.get("positions"), dict):
+                    state["positions"] = {}
+                if not isinstance(state.get("trades"), list):
+                    state["trades"] = []
+                if not isinstance(state.get("equity_hist"), list):
+                    state["equity_hist"] = []
+                return state
         except Exception:
             pass
     return default_state()
@@ -160,13 +160,11 @@ def market_value(state, prices):
 
 
 def live_step(data, p, state, allowed):
-    """One scan cycle over all coins. Returns (prices, equity)."""
     prices = {s: float(d.iloc[-1]["close"]) for s, d in data.items()}
     now_ts = time.time()
     now_str = time.strftime("%Y-%m-%d %H:%M:%S")
     pos = state["positions"]
 
-    # 1) exits (live price vs stop / target, RSI exit on last closed candle)
     for sym in list(pos):
         if sym not in prices:
             continue
@@ -181,7 +179,6 @@ def live_step(data, p, state, allowed):
         if reason:
             close_position(state, sym, px, reason, now_str)
 
-    # 2) entries (only once per newly closed candle per coin)
     equity = market_value(state, prices)
     for sym in sorted(allowed):
         if sym not in data:
@@ -207,7 +204,6 @@ def live_step(data, p, state, allowed):
                 pos[sym] = dict(qty=qty, entry=px, stop=px - risk, tp=px + risk * p["rr"],
                                 cost=cost, entry_time=now_str)
 
-    # 3) equity history for the cumulative-profit chart
     equity = market_value(state, prices)
     hist = state["equity_hist"]
     if not hist or now_ts - hist[-1][0] >= 60:
@@ -217,7 +213,7 @@ def live_step(data, p, state, allowed):
 
 
 # --------------------------------------------------------------------------
-# Backtest (one coin, same rules as live, starts with START_CASH)
+# Backtest
 # --------------------------------------------------------------------------
 def backtest(df, p):
     cash, pos = START_CASH, None
@@ -252,7 +248,6 @@ def backtest(df, p):
 
 
 def stats(trades, eq):
-    """Summary numbers for a trades DataFrame and an equity Series."""
     out = dict(ret=0.0, dd=0.0, trades=0, win_rate=0.0, pf=None)
     if len(eq):
         out["ret"] = (eq.iloc[-1] / START_CASH - 1) * 100
@@ -294,7 +289,7 @@ ALL_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
 def show_df(df):
     try:
         st.dataframe(df, width="stretch", hide_index=True)
-    except Exception:  # older Streamlit versions
+    except Exception:
         st.dataframe(df, use_container_width=True, hide_index=True)
 
 
@@ -302,7 +297,6 @@ def fmt_price(x):
     return f"${x:,.2f}" if x >= 1 else f"${x:.5f}"
 
 
-# ------------------------------- sidebar -------------------------------
 with st.sidebar:
     st.header("⚙️ Settings")
     symbols = st.multiselect("Coins to scan", ALL_SYMBOLS, default=ALL_SYMBOLS[:8])
@@ -337,7 +331,6 @@ if not symbols:
 tab_live, tab_bt = st.tabs(["🔴 Live (Paper)", "🧪 Backtest"])
 
 
-# ------------------------------- live panel -------------------------------
 @st.fragment(run_every="20s" if auto else None)
 def live_panel():
     state = st.session_state.state
@@ -431,7 +424,6 @@ with tab_live:
     live_panel()
 
 
-# ------------------------------- backtest -------------------------------
 with tab_bt:
     st.write("Tests the same rules on the last 1000 candles of every selected coin "
              "(each coin starts with $1000, fees included).")
